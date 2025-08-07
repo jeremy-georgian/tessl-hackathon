@@ -1,6 +1,8 @@
 from pydantic import BaseModel
 from pydantic_ai import Agent
 import logfire
+import os
+from pathlib import Path
 
 logfire.configure()
 logfire.instrument_pydantic_ai()
@@ -61,18 +63,47 @@ def summarize_code(file_content: str) -> list[LLMTextRepresentation]:
     result = agent.run_sync(prompt)
     return result.output
 
+
+def summarize_directory(directory_path: str) -> dict[str, list[LLMTextRepresentation]]:
+    """Analyze all code files in a directory and return summarized functions for each file."""
+    directory = Path(directory_path)
+
+    if not directory.exists() or not directory.is_dir():
+        raise ValueError(f"Directory {directory_path} does not exist or is not a directory")
+
+    results = {}
+
+    # Common code file extensions
+    code_extensions = {'.py'}
+
+    for file_path in directory.rglob('*'):
+        if file_path.is_file() and file_path.suffix in code_extensions:
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    file_content = f.read()
+
+                # Get relative path for cleaner output
+                relative_path = str(file_path.relative_to(directory))
+                results[relative_path] = summarize_code(file_content)
+
+            except (UnicodeDecodeError, PermissionError) as e:
+                logfire.info(f"Skipping {file_path}: {e}")
+                continue
+
+    return results
+
 if __name__ == "__main__":
-    # Test the summarize_code function with a sample Python file
-    with open("sample_file.py") as f:
-        sample_code = f.read()
+    # Summarize all Python files in the pydantic_ai models directory
+    directory_path = "/Users/jeremychua/dev/pydantic-ai/pydantic_ai_slim/pydantic_ai/models"
+    results = summarize_directory(directory_path)
 
-    result = summarize_code(sample_code)
-
-    for r in result:
-        print(f"class name: {r.class_name}")
-        print(f"function name: {r.function_name}")
-        print(f"input args: {r.input_args}")
-        print(f"output args: {r.output_args}")
-        print(f"description: {r.description}")
-        print("\n\n-----\n\n")
+    for file_path, functions in results.items():
+        print(f"\n=== {file_path} ===")
+        for func in functions:
+            print(f"class name: {func.class_name}")
+            print(f"function name: {func.function_name}")
+            print(f"input args: {func.input_args}")
+            print(f"output args: {func.output_args}")
+            print(f"description: {func.description}")
+            print("\n-----\n")
 
