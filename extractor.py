@@ -8,6 +8,7 @@ import sqlite3
 import json
 import hashlib
 import asyncio
+from openai import AsyncOpenAI
 
 tpuf = turbopuffer.Turbopuffer(
     # API tokens are created in the dashboard: https://turbopuffer.com/dashboard
@@ -17,6 +18,9 @@ tpuf = turbopuffer.Turbopuffer(
 )
 
 ns = tpuf.namespace(f'tessl-hackathon-{os.getenv("USER")}')
+
+# Initialize OpenAI client for embeddings
+openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # Initialize SQLite cache database
 def init_cache_db():
@@ -137,7 +141,7 @@ async def summarize_code_async(file_content: str, file_path: str = None) -> list
         if cached_functions:
             logfire.info(f"Using cached results for {file_path}")
             return cached_functions
-    
+
     logfire.info(f"Analyzing code for {file_path or 'unknown file'}")
     agent = Agent(
         'openai:gpt-4o',
@@ -169,13 +173,66 @@ async def summarize_code_async(file_content: str, file_path: str = None) -> list
 
     result = await agent.run(prompt)
     functions = result.output
-    
+
     # Save to cache if file_path is provided
     if file_path:
         file_hash = get_file_hash(file_content)
         save_functions_to_cache(file_path, file_hash, functions)
-    
+
     return functions
+
+
+async def create_embedding_from_description(description: str) -> list[float]:
+    """Generate embedding from function description using OpenAI."""
+    try:
+        response = await openai_client.embeddings.create(
+            model="text-embedding-3-small",
+            input=description
+        )
+        return response.data[0].embedding
+    except Exception as e:
+        logfire.error(f"Error generating embedding: {e}")
+        raise
+
+
+async def save_function_to_turbopuffer(func: LLMTextRepresentation, file_path: str):
+    """Save function representation and its description embedding to TurboPuffer."""
+    # Create unique ID for this function using full file path
+    func_full_id = f"{file_path}#{func.class_name or 'root'}#{func.function_name}"
+    
+    # Create a hash that fits TurboPuffer's 64-byte limitation
+    func_id = hashlib.sha256(func_full_id.encode('utf-8')).hexdigest()[:63]  # 63 chars to be safe
+
+    # Generate embedding from description
+    embedding = await create_embedding_from_description(func.description)
+    
+    # Create the vector record with minimal metadata
+    vector_data = {
+        "id": func_id,
+        "vector": embedding,
+        "file_path": file_path,
+        "class_name": func.class_name,
+        "function_name": func.function_name,
+    }
+
+    try:
+        # Use write() with upsert_rows as per TurboPuffer API (run in thread pool for async)
+        await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: ns.write(
+                upsert_rows=[vector_data],
+                distance_metric='cosine_distance',
+                schema={
+                    "file_path": {"type": "string"},
+                    "class_name": {"type": "string"},
+                    "function_name": {"type": "string"},
+                }
+            )
+        )
+        logfire.info(f"Saved embedding for {func_id} to TurboPuffer")
+    except Exception as e:
+        logfire.error(f"Error saving to TurboPuffer: {e}")
+        raise
 
 
 def get_file_hash(file_content: str) -> str:
@@ -187,15 +244,15 @@ def is_file_cached(file_path: str, file_hash: str) -> bool:
     """Check if a file with the given hash is already cached."""
     conn = sqlite3.connect('function_cache.db')
     cursor = conn.cursor()
-    
+
     cursor.execute('''
-        SELECT COUNT(*) FROM function_cache 
+        SELECT COUNT(*) FROM function_cache
         WHERE file_path = ? AND file_hash = ?
     ''', (file_path, file_hash))
-    
+
     count = cursor.fetchone()[0]
     conn.close()
-    
+
     return count > 0
 
 
@@ -284,9 +341,9 @@ def summarize_directory(directory_path: str) -> dict[str, list[LLMTextRepresenta
                 # First, read just enough to generate a hash and check cache
                 with open(file_path, 'r', encoding='utf-8') as f:
                     file_content = f.read()
-                
+
                 file_hash = get_file_hash(file_content)
-                
+
                 # Check if this exact file content is already cached
                 if is_file_cached(str(file_path), file_hash):
                     logfire.info(f"File {file_path} is already cached, retrieving from cache")
@@ -314,20 +371,32 @@ async def process_single_file(file_path: Path, directory: Path, semaphore: async
             # Read file content and generate hash
             with open(file_path, 'r', encoding='utf-8') as f:
                 file_content = f.read()
-            
+
             file_hash = get_file_hash(file_content)
-            
+
             # Check if this exact file content is already cached
             if is_file_cached(str(file_path), file_hash):
                 logfire.info(f"File {file_path} is already cached, retrieving from cache")
                 cached_functions = get_cached_functions(str(file_path), file_hash)
                 if cached_functions:
                     relative_path = str(file_path.relative_to(directory))
-                    return relative_path, cached_functions
+                    functions = cached_functions
+                else:
+                    # If cache check failed, proceed with analysis
+                    relative_path = str(file_path.relative_to(directory))
+                    functions = await summarize_code_async(file_content, str(file_path))
+            else:
+                # If not cached, proceed with async analysis
+                relative_path = str(file_path.relative_to(directory))
+                functions = await summarize_code_async(file_content, str(file_path))
 
-            # If not cached, proceed with async analysis
-            relative_path = str(file_path.relative_to(directory))
-            functions = await summarize_code_async(file_content, str(file_path))
+            # Save each function to TurboPuffer with embeddings (happens for both cached and new)
+            for func in functions:
+                try:
+                    await save_function_to_turbopuffer(func, str(file_path))
+                except Exception as e:
+                    logfire.error(f"Failed to save {func.function_name} to TurboPuffer: {e}")
+
             return relative_path, functions
 
         except (UnicodeDecodeError, PermissionError) as e:
@@ -338,53 +407,53 @@ async def process_single_file(file_path: Path, directory: Path, semaphore: async
 async def summarize_directory_async(directory_path: str, max_concurrent: int = 4) -> dict[str, list[LLMTextRepresentation]]:
     """Async version that analyzes all code files in a directory with configurable concurrency."""
     directory = Path(directory_path)
-    
+
     if not directory.exists() or not directory.is_dir():
         raise ValueError(f"Directory {directory_path} does not exist or is not a directory")
-    
+
     # Common code file extensions
     code_extensions = {'.py'}
-    
+
     # Find all code files
     code_files = [
         file_path for file_path in directory.rglob('*')
         if file_path.is_file() and file_path.suffix in code_extensions
     ]
-    
+
     logfire.info(f"Found {len(code_files)} code files to process with max_concurrent={max_concurrent}")
-    
+
     # Create semaphore for concurrency control
     semaphore = asyncio.Semaphore(max_concurrent)
-    
+
     # Process files concurrently
     tasks = [
         process_single_file(file_path, directory, semaphore)
         for file_path in code_files
     ]
-    
+
     # Wait for all tasks to complete
     results_list = await asyncio.gather(*tasks)
-    
+
     # Convert results to dictionary, filtering out None results
     results = {}
     for result in results_list:
         if result is not None:
             relative_path, functions = result
             results[relative_path] = functions
-    
+
     return results
 
 async def main():
     """Main async function to run directory summarization."""
     # Summarize all Python files in the pydantic_ai models directory
     directory_path = "/Users/jeremychua/dev/pydantic-ai/pydantic_ai_slim/pydantic_ai/models"
-    
+
     # Use async version with configurable concurrency (default 4)
     max_concurrent = int(os.getenv("MAX_CONCURRENT", "4"))
     logfire.info(f"Starting analysis with max_concurrent={max_concurrent}")
-    
+
     results = await summarize_directory_async(directory_path, max_concurrent=max_concurrent)
-    
+
     for file_path, functions in results.items():
         print(f"\n=== {file_path} ===")
         for func in functions:
