@@ -3,6 +3,16 @@ from pydantic_ai import Agent
 import logfire
 import os
 from pathlib import Path
+import turbopuffer
+
+tpuf = turbopuffer.Turbopuffer(
+    # API tokens are created in the dashboard: https://turbopuffer.com/dashboard
+    api_key=os.getenv("TURBOPUFFER_API_KEY"),
+    # Pick the right region: https://turbopuffer.com/docs/regions
+    region="gcp-us-central1",
+)
+
+ns = tpuf.namespace(f'tessl-hackathon-{os.getenv("USER")}')
 
 logfire.configure()
 logfire.instrument_pydantic_ai()
@@ -89,6 +99,7 @@ def summarize_directory(directory_path: str) -> dict[str, list[LLMTextRepresenta
             except (UnicodeDecodeError, PermissionError) as e:
                 logfire.info(f"Skipping {file_path}: {e}")
                 continue
+        break
 
     return results
 
